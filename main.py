@@ -258,10 +258,10 @@ class BBSTerminalApp:
         self.paned.add(self.output_frame)
         self.paned.paneconfig(self.output_frame, minsize=200)  # Set minimum size for the top pane
         self.terminal_display = tk.Text(self.output_frame, wrap=tk.WORD, state=tk.DISABLED, bg="black", font=("Courier New", 10))
-        self.terminal_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.terminal_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         scroll_bar = ttk.Scrollbar(self.output_frame, command=self.terminal_display.yview)
         scroll_bar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.terminal_display.configure(yscrollcommand=scroll_bar.set)
+        self.terminal_display.configure(yscrollcommand=self.on_scroll_change)
         self.define_ansi_tags()
         self.terminal_display.tag_configure("hyperlink", foreground="blue", underline=True)
         self.terminal_display.tag_bind("hyperlink", "<Button-1>", self.open_hyperlink)
@@ -489,6 +489,7 @@ class BBSTerminalApp:
         """Open a Toplevel for font settings, automation toggles, etc."""
         settings_win = tk.Toplevel(self.master)
         settings_win.title("Settings")
+        settings_win.attributes('-topmost', True)  # Keep window on top
 
         row_index = 0
 
@@ -671,14 +672,33 @@ class BBSTerminalApp:
         try:
             self.stop_event.set()
             self.stop_keep_alive()
+            
+            # Clear the members list before disconnecting
+            self.clear_chat_members()
 
             if self.writer:
                 try:
-                    # Try to close the writer and allow it time to drain
-                    self.writer.close()
-                    await self.writer.drain()
+                    # Send disconnect command if still connected
+                    try:
+                        self.writer.write('quit\r\n')
+                        await self.writer.drain()
+                    except Exception:
+                        pass  # Ignore errors during quit command
+                    
+                    # Close the writer
+                    if not self.writer.is_closing():
+                        self.writer.close()
+                        # Some telnet writers may not have wait_closed
+                        if hasattr(self.writer, 'wait_closed'):
+                            try:
+                                await self.writer.wait_closed()
+                            except Exception as e:
+                                print(f"Warning: Error during wait_closed: {e}")
+                        else:
+                            # Give the writer a moment to finish closing
+                            await asyncio.sleep(0.1)
                 except Exception as e:
-                    print(f"Error closing writer: {e}")
+                    print(f"Warning: Error closing writer: {e}")
 
             # Mark the connection as closed
             self.connected = False
@@ -696,6 +716,12 @@ class BBSTerminalApp:
             self.msg_queue.put_nowait("Disconnected from BBS.\n")
         finally:
             self._disconnecting = False
+
+    def clear_chat_members(self):
+        """Clear the active chat members list but preserve last seen timestamps."""
+        self.chat_members = set()
+        self.save_chat_members_file()
+        self.update_members_display()
 
     # 1.6️⃣ MESSAGES
     def process_incoming_messages(self):
@@ -719,6 +745,8 @@ class BBSTerminalApp:
         # Precompile an ANSI escape code regex
         ansi_regex = re.compile(r'\x1b\[[0-9;]*m')
         
+        skip_display = False  # Flag to track if we're in a banner section
+        
         for line in lines[:-1]:
             # Remove ANSI codes for filtering purposes only.
             clean_line = ansi_regex.sub('', line).strip()
@@ -730,23 +758,35 @@ class BBSTerminalApp:
                     self.update_chat_members(self.user_list_buffer)
                     self.collecting_users = False
                     self.user_list_buffer = []
-                # continue  # Skip displaying header lines
+                    skip_display = False  # End of banner section
+                    continue
+                skip_display = True  # Skip displaying banner content
+                continue
             
             if clean_line.startswith("You are in"):
                 self.user_list_buffer = [line]
                 self.collecting_users = True
-                # continue  # Skip displaying header line
+                skip_display = True  # Start of banner section
+                continue
             
-            # Skip the line immediately following the header block if it starts with "Just press"
-            # if clean_line.startswith("Just press") and not self.collecting_users:
-            #     continue
-            
+            # Skip displaying banner-related lines
+            if any(pattern in clean_line for pattern in [
+                "Topic:",
+                "Just press",
+                "are here with you"
+            ]):
+                continue
+                
             # --- Process directed messages ---
-            directed_msg_match = re.match(r'^From\s+(\S+)\s+\((to you|whispered)\):\s*(.+)$', clean_line, re.IGNORECASE)
+            directed_msg_match = re.match(r'^From\s+(\S+)\s+\((whispered|to you)\):\s*(.+)$', clean_line, re.IGNORECASE)
             if directed_msg_match:
-                sender, _, message = directed_msg_match.groups()
+                sender, msg_type, message = directed_msg_match.groups()
                 self.append_directed_message(f"From {sender}: {message}\n")
-                self.play_ding_sound()  # Play ding sound for directed messages
+                self.play_ding_sound()
+                # Save to chatlog and check for hyperlinks
+                timestamp = time.strftime("[%Y-%m-%d %H:%M:%S] ")
+                self.save_chatlog_message(sender, timestamp + line)
+                self.parse_and_store_hyperlinks(message, sender)
                 # Display directed messages in the main terminal as well
                 self.append_terminal_text(line + "\n", "normal")
                 continue
@@ -755,26 +795,30 @@ class BBSTerminalApp:
             if clean_line.startswith("Action listing for:"):
                 self.actions = []
                 self.collecting_actions = True
+                # Immediately send Enter keystroke when we start collecting actions
+                if self.connected and self.writer:
+                    self.writer.write("\r\n")
+                    self.loop.call_soon_threadsafe(self.writer.drain)
                 continue
             if clean_line == ":" and self.collecting_actions:
-                self.update_actions_listbox()
                 self.collecting_actions = False
+                self.master.after_idle(self.update_actions_listbox)
                 continue
             if self.collecting_actions:
                 self.actions.extend(clean_line.split())
-                self.update_actions_listbox()
                 continue
             
-            # --- Process and display non-header lines ---
-            self.append_terminal_text(line + "\n", "normal")
-            self.check_triggers(line)
-            self.parse_and_save_chatlog_message(line)
-            if self.auto_login_enabled.get() or self.logon_automation_enabled.get():
-                self.detect_logon_prompt(line)
-            
-            # Play ding sound for any message
-            if re.match(r'^From\s+\S+', clean_line, re.IGNORECASE):
-                self.play_ding_sound()
+            # Only display the line if it's not part of the banner and not empty
+            if not skip_display and clean_line:
+                self.append_terminal_text(line + "\n", "normal")
+                self.check_triggers(line)
+                self.parse_and_save_chatlog_message(line)
+                if self.auto_login_enabled.get() or self.logon_automation_enabled.get():
+                    self.detect_logon_prompt(line)
+                
+                # Play ding sound for any message
+                if re.match(r'^From\s+\S+', clean_line, re.IGNORECASE):
+                    self.play_ding_sound()
         
         self.partial_line = lines[-1]
 
@@ -794,7 +838,7 @@ class BBSTerminalApp:
         
         # Skip system messages and banner info
         skip_patterns = [
-            r"You are in the",
+            r"You are in",
             r"Topic:",
             r"Just press",
             r"are here with you",
@@ -806,20 +850,31 @@ class BBSTerminalApp:
         if any(re.search(pattern, clean_line, re.IGNORECASE) for pattern in skip_patterns):
             return
 
-        # Try to extract message format "From <username>: <message>"
-        message_match = re.match(r'^From\s+(\S+?)(?:@[\w.]+)?(?:\s+\([^)]+\))?\s*:\s*(.+)$', clean_line)
-        if message_match:
-            sender = message_match.group(1)
-            message = message_match.group(2)
-            
-            # Add timestamp if not present
-            if not clean_line.strip().startswith('['):
-                clean_line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + clean_line
+        # Enhanced patterns to match different message types
+        message_patterns = [
+            # Whispered messages - check these first
+            r'^From\s+(\S+?)(?:@[\w.]+)?\s*\(whispered(?:\s+to\s+\S+)?\):\s*(.+)$',
+            # Normal messages
+            r'^From\s+(\S+?)(?:@[\w.]+)?(?:\s+\([^)]+\))?\s*:\s*(.+)$',
+            # Directed messages (to someone)
+            r'^From\s+(\S+?)(?:@[\w.]+)?\s*\(to\s+[^)]+\):\s*(.+)$'
+        ]
 
-            # Save to chatlog
-            self.save_chatlog_message(sender, clean_line)
-            # Extract any URLs
-            self.parse_and_store_hyperlinks(clean_line, sender)
+        for pattern in message_patterns:
+            message_match = re.match(pattern, clean_line, re.IGNORECASE)
+            if message_match:
+                sender = message_match.group(1)
+                message = message_match.group(2)
+                
+                # Add timestamp if not present
+                if not clean_line.strip().startswith('['):
+                    clean_line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + clean_line
+
+                # Save to chatlog
+                self.save_chatlog_message(sender, clean_line)
+                # Extract any URLs (pass sender for attribution)
+                self.parse_and_store_hyperlinks(clean_line, sender)
+                break
 
     def send_message(self, event=None):
         """Send the user's typed message to the BBS."""
@@ -839,13 +894,16 @@ class BBSTerminalApp:
             prefix = "Gos " if self.mud_mode.get() else ""
             message = prefix + user_input + "\r\n"
             
-        # Send message
+        # Send message using asyncio.run_coroutine_threadsafe
         if self.connected and self.writer:
-            self.writer.write(message)
-            try:
-                self.loop.call_soon_threadsafe(self.writer.drain)
-            except Exception as e:
-                print(f"Error sending message: {e}")
+            async def send():
+                try:
+                    self.writer.write(message)
+                    await self.writer.drain()
+                except Exception as e:
+                    print(f"Error sending message: {e}")
+                    
+            asyncio.run_coroutine_threadsafe(send(), self.loop)
 
     def send_username(self):
         """Send the username to the BBS."""
@@ -884,11 +942,14 @@ class BBSTerminalApp:
         """Send a custom message (for trigger responses)."""
         if self.connected and self.writer:
             message = message + "\r\n"
-            self.writer.write(message)
-            try:
-                self.loop.call_soon_threadsafe(self.writer.drain)
-            except Exception as e:
-                print(f"Error sending custom message: {e}")
+            async def send():
+                try:
+                    self.writer.write(message)
+                    await self.writer.drain()
+                except Exception as e:
+                    print(f"Error sending custom message: {e}")
+                    
+            asyncio.run_coroutine_threadsafe(send(), self.loop)
 
     def send_action(self, action):
         """Send an action to the BBS, optionally appending the highlighted username."""
@@ -901,14 +962,17 @@ class BBSTerminalApp:
             action = f"{action} {username}"
             
         message = action + "\r\n"
-        self.writer.write(message)
-        try:
-            self.loop.call_soon_threadsafe(self.writer.drain)
-            # Deselect the action after sending
-            self.actions_listbox.selection_clear(0, tk.END)
-            self.members_listbox.selection_clear(0, tk.END)
-        except Exception as e:
-            print(f"Error sending action: {e}")
+        async def send():
+            try:
+                self.writer.write(message)
+                await self.writer.drain()
+                # Deselect the action after sending
+                self.actions_listbox.selection_clear(0, tk.END)
+                self.members_listbox.selection_clear(0, tk.END)
+            except Exception as e:
+                print(f"Error sending action: {e}")
+                
+        asyncio.run_coroutine_threadsafe(send(), self.loop)
 
     # 1.7️⃣ KEEP-ALIVE
     async def keep_alive(self):
@@ -944,10 +1008,12 @@ class BBSTerminalApp:
         """Open a Toplevel window to manage favorite BBS addresses."""
         if self.favorites_window and self.favorites_window.winfo_exists():
             self.favorites_window.lift()
+            self.favorites_window.attributes('-topmost', True)
             return
 
         self.favorites_window = tk.Toplevel(self.master)
         self.favorites_window.title("Favorite BBS Addresses")
+        self.favorites_window.attributes('-topmost', True)  # Keep window on top
 
         row_index = 0
         self.favorites_listbox = tk.Listbox(self.favorites_window, height=10, width=50)
@@ -1042,10 +1108,12 @@ class BBSTerminalApp:
         """Open a Toplevel window to manage triggers."""
         if self.triggers_window and self.triggers_window.winfo_exists():
             self.triggers_window.lift()
+            self.triggers_window.attributes('-topmost', True)
             return
 
         self.triggers_window = tk.Toplevel(self.master)
         self.triggers_window.title("Automation Triggers")
+        self.triggers_window.attributes('-topmost', True)  # Keep window on top
 
         row_index = 0
         triggers_frame = ttk.Frame(self.triggers_window)
@@ -1083,6 +1151,7 @@ class BBSTerminalApp:
         self.terminal_display.configure(state=tk.NORMAL)
         self.parse_ansi_and_insert(text)
         self.terminal_display.see(tk.END)
+        self.master.update_idletasks()  # Force update to ensure proper display
         self.terminal_display.configure(state=tk.DISABLED)
 
     def parse_ansi_and_insert(self, text_data):
@@ -1200,65 +1269,106 @@ class BBSTerminalApp:
         label = tk.Label(self.preview_window, text="Loading preview...", background="white")
         label.pack()
 
-        # Fetch and display the thumbnail in a separate thread
-        threading.Thread(target=self._fetch_and_display_thumbnail, args=(url, label), daemon=True).start()
+        # Start a new thread to fetch the preview
+        threading.Thread(target=self._fetch_preview, args=(url, label), daemon=True).start()
 
-    def _fetch_and_display_thumbnail(self, url, label):
-        """Fetch and display the thumbnail. Handle GIFs and static images."""
+    def _fetch_preview(self, url, label):
+        """Fetch either an image thumbnail or website favicon."""
         try:
-            response = requests.get(url, timeout=5)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "")
-
-            # Check if the URL is a GIF or another image type
-            if "image" in content_type:
-                image_data = BytesIO(response.content)
-
-                # Process GIF
-                if "gif" in content_type or url.endswith(".gif"):
-                    gif = Image.open(image_data)
-                    frames = []
-                    try:
-                        while True:
-                            frame = gif.copy()
-                            frame.thumbnail((200, 150))  # Resize
-                            frames.append(ImageTk.PhotoImage(frame))
-                            gif.seek(len(frames))  # Move to next frame
-                    except EOFError:
-                        pass  # End of GIF frames
-
-                    if frames:
-                        self._display_animated_gif(frames, label)
-                    return
-
-                # Process static images
-                image = Image.open(image_data)
-                image.thumbnail((200, 150))
-                photo = ImageTk.PhotoImage(image)
-
-                def update_label():
-                    if self.preview_window and label.winfo_exists():
-                        label.config(image=photo, text="")
-                        label.image = photo  # Keep reference to avoid garbage collection
-                self.master.after(0, update_label)
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            # Check if URL is directly an image
+            if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                response = requests.get(url, headers=headers, timeout=5)
+                response.raise_for_status()
+                self._handle_image_preview(response.content, label, is_gif=url.lower().endswith('.gif'))
+            else:
+                # Try to get webpage first to check for proper image content type
+                response = requests.get(url, headers=headers, timeout=5)
+                content_type = response.headers.get("Content-Type", "").lower()
+                
+                if "image" in content_type:
+                    self._handle_image_preview(response.content, label, is_gif='gif' in content_type)
+                else:
+                    self._handle_website_preview(url, label)
 
         except Exception as e:
-            print(f"DEBUG: Exception in _fetch_and_display_thumbnail: {e}")
+            print(f"DEBUG: Preview error: {e}")
             def update_label_error():
                 if self.preview_window and label.winfo_exists():
                     label.config(text="Preview not available")
             self.master.after(0, update_label_error)
 
-    def _display_animated_gif(self, frames, label):
-        """Display animated GIF in the label."""
-        def animate(index):
-            if self.preview_window and label.winfo_exists():
-                label.config(image=frames[index])
-                index = (index + 1) % len(frames)
-                label.image = frames[index]  # Keep reference
-                label.after(100, animate, index)  # Adjust speed as needed
+    def _handle_image_preview(self, image_data, label, is_gif=False):
+        """Handle preview for image content, including GIFs."""
+        try:
+            image = Image.open(BytesIO(image_data))
+            
+            if is_gif and getattr(image, "is_animated", False):
+                # Handle animated GIF
+                frames = []
+                try:
+                    while True:
+                        frame = image.copy()
+                        frame.thumbnail((200, 150))
+                        frames.append(ImageTk.PhotoImage(frame))
+                        image.seek(len(frames))
+                except EOFError:
+                    pass
+                
+                if frames:
+                    def animate(frame_index=0):
+                        if self.preview_window and label.winfo_exists():
+                            label.config(image=frames[frame_index])
+                            label.image = frames[frame_index]  # Keep reference
+                            next_frame = (frame_index + 1) % len(frames)
+                            self.master.after(100, lambda: animate(next_frame))
+                    
+                    self.master.after(0, animate)
+                    return
+            else:
+                # Handle static image
+                image.thumbnail((200, 150))
+                photo = ImageTk.PhotoImage(image)
+                
+                def update_label():
+                    if self.preview_window and label.winfo_exists():
+                        label.config(image=photo, text="")
+                        label.image = photo
+                self.master.after(0, update_label)
+        except Exception as e:
+            print(f"Image preview error: {e}")
 
-        self.master.after(0, animate, 0)
+    def _handle_website_preview(self, url, label):
+        """Handle preview for website content by showing favicon."""
+        try:
+            # Parse the URL to get the base domain
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            favicon_url = f"{parsed_url.scheme}://{parsed_url.netloc}/favicon.ico"
+            
+            # Try to get the favicon
+            response = requests.get(favicon_url, timeout=5)
+            if response.status_code == 200:
+                image = Image.open(BytesIO(response.content))
+                # Resize favicon to reasonable size
+                image = image.resize((32, 32), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+
+                def update_label():
+                    if self.preview_window and label.winfo_exists():
+                        label.config(image=photo, text=parsed_url.netloc)
+                        label.image = photo
+                self.master.after(0, update_label)
+            else:
+                raise Exception("Favicon not found")
+        except Exception as e:
+            print(f"Favicon preview error: {e}")
+            # Show domain name if favicon fails
+            parsed_url = urlparse(url)
+            def update_label():
+                if self.preview_window and label.winfo_exists():
+                    label.config(text=parsed_url.netloc)
+            self.master.after(0, update_label)
 
     def hide_thumbnail_preview(self, event):
         """Hide the thumbnail preview."""
@@ -1374,15 +1484,63 @@ class BBSTerminalApp:
             self.clear_chatlog_for_user(username)
             self.display_chatlog_messages(None)  # Refresh the display
 
+    def load_panel_sizes(self):
+        """Load saved panel sizes from file."""
+        try:
+            if os.path.exists("panel_sizes.json"):
+                with open("panel_sizes.json", "r") as file:
+                    return json.load(file)
+        except Exception as e:
+            print(f"Error loading panel sizes: {e}")
+        return {
+            "users": 150,  # 15 chars * ~10 pixels per char
+            "links": 300,  # 30 chars * ~10 pixels per char
+        }
+
+    def save_panel_sizes(self):
+        """Save current panel sizes to file."""
+        if not hasattr(self, 'chatlog_window') or not self.chatlog_window.winfo_exists():
+            return
+            
+        try:
+            # Get current sizes from the paned window
+            paned = self.chatlog_window.nametowidget("main_paned")
+            sash_pos1 = paned.sash_coord(0)[0]  # Position of first sash
+            sash_pos2 = paned.sash_coord(1)[0]  # Position of second sash
+            
+            sizes = {
+                "users": sash_pos1,
+                "links": paned.winfo_width() - sash_pos2
+            }
+            
+            with open("panel_sizes.json", "w") as file:
+                json.dump(sizes, file)
+        except Exception as e:
+            print(f"Error saving panel sizes: {e}")
+
     def show_chatlog_window(self):
         """Open a Toplevel window to manage chatlog and hyperlinks."""
         if self.chatlog_window and self.chatlog_window.winfo_exists():
             self.chatlog_window.lift()
+            self.chatlog_window.attributes('-topmost', True)
             return
+
+        # Load saved font settings
+        saved_font_settings = self.load_font_settings()
+        chatlog_font_settings = {
+            'font': (saved_font_settings.get('font_name', "Courier New"), 
+                    saved_font_settings.get('font_size', 10)),
+            'fg': saved_font_settings.get('fg', 'white'),
+            'bg': saved_font_settings.get('bg', 'black')
+        }
+
+        # Load saved panel sizes or use defaults
+        panel_sizes = self.load_panel_sizes()
 
         self.chatlog_window = tk.Toplevel(self.master)
         self.chatlog_window.title("Chatlog")
-        self.chatlog_window.geometry("1200x600")  # Slightly wider default size
+        self.chatlog_window.geometry("1200x600")
+        self.chatlog_window.attributes('-topmost', True)
         
         # Make the window resizable
         self.chatlog_window.columnconfigure(0, weight=1)
@@ -1393,62 +1551,50 @@ class BBSTerminalApp:
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1)
 
-        # Create paned window to hold all panels
-        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        # Create paned window with users/messages/links panels
+        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL, name="main_paned")
         paned.grid(row=0, column=0, sticky="nsew")
 
-        # Left panel - Users list (25% width)
-        users_frame = ttk.Frame(paned)
+        # Users panel
+        users_frame = ttk.Frame(paned, width=panel_sizes["users"])
+        users_frame.pack_propagate(False)  # Prevent shrinking below specified width
         users_frame.columnconfigure(0, weight=1)
         users_frame.rowconfigure(1, weight=1)
         
         ttk.Label(users_frame, text="Users").grid(row=0, column=0, sticky="w")
-        self.chatlog_listbox = tk.Listbox(users_frame, height=10)
+        self.chatlog_listbox = tk.Listbox(users_frame, height=10, **chatlog_font_settings)
         self.chatlog_listbox.grid(row=1, column=0, sticky="nsew")
         users_scrollbar = ttk.Scrollbar(users_frame, command=self.chatlog_listbox.yview)
         users_scrollbar.grid(row=1, column=1, sticky="ns")
         self.chatlog_listbox.configure(yscrollcommand=users_scrollbar.set)
         self.chatlog_listbox.bind("<<ListboxSelect>>", self.display_chatlog_messages)
         
-        # Create context menu for users list
-        users_menu = tk.Menu(self.chatlog_listbox, tearoff=0)
-        users_menu.add_command(label="Delete", command=self.delete_selected_user)
+        paned.add(users_frame)
 
-        def show_users_menu(event):
-            try:
-                self.chatlog_listbox.selection_clear(0, tk.END)
-                self.chatlog_listbox.selection_set(self.chatlog_listbox.nearest(event.y))
-                users_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                users_menu.grab_release()
-
-        self.chatlog_listbox.bind("<Button-3>", show_users_menu)
-        
-        paned.add(users_frame, weight=25)
-
-        # Middle panel - Messages (50% width)
+        # Messages panel (takes remaining space)
         messages_frame = ttk.Frame(paned)
         messages_frame.columnconfigure(0, weight=1)
         messages_frame.rowconfigure(1, weight=1)
         
         ttk.Label(messages_frame, text="Messages").grid(row=0, column=0, sticky="w")
         self.chatlog_display = tk.Text(messages_frame, wrap=tk.WORD, state=tk.DISABLED,
-                                     bg="white", font=("Courier New", 10))
+                                 **chatlog_font_settings)
         self.chatlog_display.grid(row=1, column=0, sticky="nsew")
         messages_scrollbar = ttk.Scrollbar(messages_frame, command=self.chatlog_display.yview)
         messages_scrollbar.grid(row=1, column=1, sticky="ns")
         self.chatlog_display.configure(yscrollcommand=messages_scrollbar.set)
         
-        paned.add(messages_frame, weight=50)
+        paned.add(messages_frame)
 
-        # Right panel - Hyperlinks (25% width)
-        links_frame = ttk.Frame(paned)
+        # Links panel
+        links_frame = ttk.Frame(paned, width=panel_sizes["links"])
+        links_frame.pack_propagate(False)  # Prevent shrinking below specified width
         links_frame.columnconfigure(0, weight=1)
         links_frame.rowconfigure(1, weight=1)
         
         ttk.Label(links_frame, text="Hyperlinks").grid(row=0, column=0, sticky="w")
         self.links_display = tk.Text(links_frame, wrap=tk.WORD, state=tk.DISABLED,
-                                   bg="lightyellow", font=("Courier New", 10))
+                               **chatlog_font_settings)
         self.links_display.grid(row=1, column=0, sticky="nsew")
         links_scrollbar = ttk.Scrollbar(links_frame, command=self.links_display.yview)
         links_scrollbar.grid(row=1, column=1, sticky="ns")
@@ -1459,7 +1605,25 @@ class BBSTerminalApp:
         self.links_display.tag_bind("hyperlink", "<Enter>", self.show_chatlog_thumbnail_preview)
         self.links_display.tag_bind("hyperlink", "<Leave>", self.hide_thumbnail_preview)
         
-        paned.add(links_frame, weight=25)
+        paned.add(links_frame)
+
+        # Set initial sash positions based on saved sizes
+        def after_show():
+            total_width = paned.winfo_width()
+            users_width = panel_sizes["users"]
+            links_width = panel_sizes["links"]
+            messages_width = total_width - users_width - links_width
+            
+            # Set sash positions
+            paned.sashpos(0, users_width)  # Position between users and messages
+            paned.sashpos(1, users_width + messages_width)  # Position between messages and links
+
+        # Wait for window to be drawn before setting sash positions
+        self.chatlog_window.after(100, after_show)
+
+        # Save sizes when window is closed
+        self.chatlog_window.protocol("WM_DELETE_WINDOW", 
+            lambda: (self.save_panel_sizes(), self.chatlog_window.destroy()))
 
         # Buttons frame at bottom
         buttons_frame = ttk.Frame(main_frame)
@@ -1480,6 +1644,7 @@ class BBSTerminalApp:
         font_window.title("Change Font Settings")
         font_window.geometry("800x600")
         font_window.grab_set()  # Make window modal
+        font_window.attributes('-topmost', True)  # Keep window on top
 
         # Store current selections
         self.current_selections = {
@@ -1752,54 +1917,35 @@ class BBSTerminalApp:
         combined_clean = re.sub(r'\x1b\[[0-9;]*m', '', combined)
         print(f"[DEBUG] Raw banner: {combined_clean}")
         
-        # First extract the section between "Topic:" and "are here with you"
-        match = re.search(r'Topic:.*?(?=\s+are here with you\.)', combined_clean, re.DOTALL | re.IGNORECASE)
-        if not match:
-            return
-                
-        user_section = match.group(0)
+        # Extract all usernames from the banner
+        user_section = ""
+        if "You are in" in combined_clean and "are here with you" in combined_clean:
+            # Extract everything between "Topic:" and "are here with you"
+            match = re.search(r'Topic:.*?(?=\s+are here with you\.)', combined_clean, re.DOTALL)
+            if match:
+                user_section = match.group(0)
+                # Remove the Topic line and any parenthetical content
+                user_section = re.sub(r'Topic:.*?\n', '\n', user_section, flags=re.DOTALL)
+                user_section = re.sub(r'\(.*?\)', '', user_section)
         
-        # Remove the "Topic:" part and any parenthetical content
-        user_section = re.sub(r'Topic:.*?\)', '', user_section, flags=re.DOTALL)
-        user_section = re.sub(r'\(.*?\)', '', user_section)
-        
-        # Also get the last part that might contain a username without domain
-        last_user_match = re.search(r'and\s+(\S+)\s+are here with you', combined_clean)
-        last_username = last_user_match.group(1) if last_user_match else None
-        
-        # Split by commas and "and", clean up each part
-        parts = re.split(r',\s*|\s+and\s+', user_section)
-        
+        # Get all usernames including the last one
         final_usernames = set()
         
-        def process_username(raw_username):
-            """Helper function to process and validate a username."""
-            username = raw_username.strip()
-            if '@' in username:
-                username = username.split('@')[0]
-            
-            # Only accept usernames that:
-            # 1. Are not common words
-            # 2. Are at least 2 characters
-            # 3. Start with a letter
-            # 4. Contain only letters, numbers, dots, underscores
+        # First, get all the comma-separated usernames
+        usernames = re.findall(r'([A-Za-z][A-Za-z0-9._]+)@?[\w.]*(?:,|\s+and\s+|$)', user_section)
+        
+        # Process each username
+        for username in usernames:
+            username = username.strip()
             if (len(username) >= 2 and 
                 username.lower() not in {'in', 'the', 'chat', 'general', 'channel', 'topic', 'majorlink'} and
                 re.match(r'^[A-Za-z][A-Za-z0-9._]*$', username)):
-                return username
-            return None
-
-        # Process all parts from the main section
-        for part in parts:
-            username = process_username(part)
-            if username:
                 final_usernames.add(username)
         
-        # Process the last username if found
-        if last_username:
-            username = process_username(last_username)
-            if username:
-                final_usernames.add(username)
+        # Also check for any remaining "and Username" pattern
+        last_user_match = re.search(r'and\s+([A-Za-z][A-Za-z0-9._]+)\s+are here', combined_clean)
+        if last_user_match:
+            final_usernames.add(last_user_match.group(1))
 
         print(f"[DEBUG] Extracted usernames: {final_usernames}")
         self.chat_members = final_usernames
@@ -1871,15 +2017,17 @@ class BBSTerminalApp:
         """Play a standard ding sound effect."""
         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
 
+    async def _send_message(self, message):
+        """Async helper method to send messages."""
+        if self.connected and self.writer:
+            self.writer.write(message)
+            await self.writer.drain()
+
     def update_actions_listbox(self):
         """Update the Actions listbox with the current actions."""
         self.actions_listbox.delete(0, tk.END)
         for action in self.actions:
             self.actions_listbox.insert(tk.END, action)
-        
-        # After populating actions, send an Enter keystroke to resume BBS output
-        if self.connected and self.writer:
-            asyncio.run_coroutine_threadsafe(self._send_message("\r\n"), self.loop)
 
     def on_action_select(self, event):
         """Handle action selection and send the action to the highlighted username."""
@@ -1980,11 +2128,30 @@ class BBSTerminalApp:
 
     def parse_and_store_hyperlinks(self, message, sender=None):
         """Extract and store hyperlinks from a message."""
-        url_pattern = re.compile(r'(https?://\S+)')
+        # More comprehensive URL pattern
+        url_pattern = re.compile(r'(https?://[^\s<>"\']+|www\.[^\s<>"\']+)')
+        
+        # Extract all URLs from the message
         urls = url_pattern.findall(message)
+        
+        # Add debug output to see raw message
+        print(f"[DEBUG] Raw message: {message}")
+        print(f"[DEBUG] Found URLs: {urls}")
+        
+        # Clean URLs (remove trailing punctuation)
+        cleaned_urls = []
+        for url in urls:
+            # Remove trailing punctuation that might have been caught
+            url = re.sub(r'[.,;:]+$', '', url)
+            # Add http:// to www. urls
+            if url.startswith('www.'):
+                url = 'http://' + url
+            cleaned_urls.append(url)
+        
         timestamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
         
-        for url in urls:
+        for url in cleaned_urls:
+            print(f"[DEBUG] Storing URL: {url} from {sender}")  # Debug line
             self.store_hyperlink(url, sender, timestamp)
 
     def show_all_messages(self):
@@ -2029,23 +2196,61 @@ class BBSTerminalApp:
             # Show all messages after deletion
             self.display_chatlog_messages(None)
 
+    def on_scroll_change(self, *args):
+        """Custom scrollbar handler to ensure bottom line visibility."""
+        self.terminal_display.yview_moveto(args[0])
+        if float(args[1]) == 1.0:  # If scrolled to bottom
+            self.master.update_idletasks()
+            self.terminal_display.see(tk.END)
+
 def main():
     root = tk.Tk()
     app = BBSTerminalApp(root)
-    root.mainloop()
-    # Cleanup
-    if app.connected:
+    
+    async def cleanup():
+        """Async cleanup function to handle disconnection."""
         try:
-            asyncio.run_coroutine_threadsafe(app.disconnect_from_bbs(), app.loop).result()
+            # Cancel all pending tasks first
+            for task in asyncio.all_tasks(app.loop):
+                task.cancel()
+            
+            # Clear only the active members list
+            app.clear_chat_members()
+            
+            # Then handle the disconnect
+            if app.connected:
+                await app.disconnect_from_bbs()
+                
+            # Finally close the loop
+            app.loop.stop()
+            app.loop.close()
         except Exception as e:
-            print(f"Error during disconnect: {e}")
-    try:
-        loop = asyncio.get_event_loop()
-        if not loop.is_running():
-            loop.close()
-    except Exception as e:
-        print(f"Error closing loop: {e}")
+            print(f"Error during cleanup: {e}")
 
+    def on_closing():
+        """Handle window closing event."""
+        try:
+            # Create a new event loop for cleanup
+            cleanup_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(cleanup_loop)
+            
+            # Run cleanup synchronously with a timeout
+            cleanup_loop.run_until_complete(asyncio.wait_for(cleanup(), timeout=5.0))
+            cleanup_loop.close()
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"Error or timeout during cleanup: {e}")
+        finally:
+            # Force quit even if cleanup fails
+            try:
+                root.quit()
+            finally:
+                root.destroy()
+
+    # Bind the closing handler
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    # Start the main loop
+    root.mainloop()
 
 if __name__ == "__main__":
     main()
